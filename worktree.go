@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -159,4 +160,42 @@ func IsDirty(worktreePath string) (bool, error) {
 	}
 
 	return len(bytes.TrimSpace(out)) > 0, nil
+}
+
+// WorktreePath derives the directory for a new worktree.
+// New worktrees live at <parent>/<repo>-worktrees/<branch-with-slashes-as-dashes>.
+func WorktreePath(repoDir, branch string) string {
+	parent := filepath.Dir(repoDir)
+	repo := filepath.Base(repoDir)
+	dirName := strings.ReplaceAll(branch, "/", "-")
+	return filepath.Join(parent, repo+"-worktrees", dirName)
+}
+
+// AddWorktree runs `git worktree add <path> -b <branch>` in repoDir.
+// Returns an error (including git's stderr) if the command fails.
+func AddWorktree(repoDir, path, branch string) error {
+	cmd := exec.Command("git", "worktree", "add", path, "-b", branch)
+	cmd.Dir = repoDir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// RemoveWorktree runs `git worktree remove [--force] <path>` in repoDir.
+func RemoveWorktree(repoDir, path string, force bool) error {
+	args := []string{"worktree", "remove", path}
+	if force {
+		args = append(args, "--force")
+	}
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repoDir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
 }
