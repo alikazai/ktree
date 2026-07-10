@@ -27,6 +27,7 @@ checksum:
 
 brews:
   - name: ktree
+    directory: Formula
     repository:
       owner: alikazai
       name: homebrew-ktree
