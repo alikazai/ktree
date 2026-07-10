@@ -244,8 +244,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case worktreeCreatedMsg:
 		if msg.err != nil {
 			m.err = msg.err
-			// Stay in modeCreate so the user can fix the branch name
-			return m, nil
+			m.input.Focus()
+			return m, textinput.Blink
 		}
 		m.mode = modeList
 		m.err = nil
@@ -410,9 +410,3 @@ func (m Model) View() string {
 	return b.String()
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}

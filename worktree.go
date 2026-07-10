@@ -186,10 +186,11 @@ func AddWorktree(repoDir, path, branch string) error {
 
 // RemoveWorktree runs `git worktree remove [--force] <path>` in repoDir.
 func RemoveWorktree(repoDir, path string, force bool) error {
-	args := []string{"worktree", "remove", path}
+	args := []string{"worktree", "remove"}
 	if force {
 		args = append(args, "--force")
 	}
+	args = append(args, path)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repoDir
 	var stderr bytes.Buffer
