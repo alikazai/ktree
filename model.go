@@ -195,6 +195,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.statuses = nil // clear stale dots immediately
 			return m, m.loadWorktrees
+
+		case "enter":
+			if len(m.worktrees) > 0 {
+				m.selected = m.worktrees[m.cursor].Path
+				return m, tea.Quit
+			}
 		}
 	}
 
