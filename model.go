@@ -163,16 +163,16 @@ func (m Model) Init() tea.Cmd {
 // plus an optional command to run next. This is the only place model
 // fields should change.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// In create mode, route everything through the textinput component first.
-	// Special keys (esc, enter) are intercepted before the input sees them.
+	// In create mode, handle window size and key messages. Everything else
+	// (including worktreeCreatedMsg) falls through to the main switch.
 	if m.mode == modeCreate {
-		if wm, ok := msg.(tea.WindowSizeMsg); ok {
-			m.width = wm.Width
-			m.height = wm.Height
+		switch msg := msg.(type) {
+		case tea.WindowSizeMsg:
+			m.width = msg.Width
+			m.height = msg.Height
 			return m, nil
-		}
-		if keyMsg, ok := msg.(tea.KeyMsg); ok {
-			switch keyMsg.String() {
+		case tea.KeyMsg:
+			switch msg.String() {
 			case "ctrl+c":
 				return m, tea.Quit
 			case "esc":
@@ -187,11 +187,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.input.Blur()
 				return m, m.createWorktree(branch)
+			default:
+				var cmd tea.Cmd
+				m.input, cmd = m.input.Update(msg)
+				return m, cmd
 			}
 		}
-		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(msg)
-		return m, cmd
+		// Any other message type (worktreeCreatedMsg, statusLoadedMsg, etc.)
+		// falls through to the main switch below.
 	}
 
 	switch msg := msg.(type) {
