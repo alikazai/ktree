@@ -143,6 +143,14 @@ func (m Model) deleteWorktree(wt Worktree, force bool) tea.Cmd {
 	}
 }
 
+func (m Model) createWorktree(branch string) tea.Cmd {
+	return func() tea.Msg {
+		path := WorktreePath(m.repoDir, branch)
+		err := AddWorktree(m.repoDir, path, branch)
+		return worktreeCreatedMsg{err: err}
+	}
+}
+
 // --- Elm architecture: Init / Update / View -----------------------------
 
 // Init is called once when the program starts. Returning loadWorktrees here
@@ -155,6 +163,37 @@ func (m Model) Init() tea.Cmd {
 // plus an optional command to run next. This is the only place model
 // fields should change.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// In create mode, route everything through the textinput component first.
+	// Special keys (esc, enter) are intercepted before the input sees them.
+	if m.mode == modeCreate {
+		if wm, ok := msg.(tea.WindowSizeMsg); ok {
+			m.width = wm.Width
+			m.height = wm.Height
+			return m, nil
+		}
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			switch keyMsg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				m.mode = modeList
+				m.err = nil
+				m.input.Blur()
+				return m, nil
+			case "enter":
+				branch := strings.TrimSpace(m.input.Value())
+				if branch == "" {
+					return m, nil
+				}
+				m.input.Blur()
+				return m, m.createWorktree(branch)
+			}
+		}
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
+		return m, cmd
+	}
+
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
@@ -199,6 +238,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statuses = nil
 		return m, m.loadWorktrees
 
+	case worktreeCreatedMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			// Stay in modeCreate so the user can fix the branch name
+			return m, nil
+		}
+		m.mode = modeList
+		m.err = nil
+		m.statuses = nil
+		return m, m.loadWorktrees
+
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -229,6 +279,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.mode = modeDeleteConfirm
 					m.err = nil
 				}
+			case "n":
+				m.mode = modeCreate
+				m.err = nil
+				m.input.SetValue("")
+				m.input.Focus()
+				return m, textinput.Blink
 			}
 			return m, nil
 
@@ -313,10 +369,26 @@ func (m Model) View() string {
 	case modeList:
 		b.WriteString(helpStyle.Render("↑/k up · ↓/j down · enter switch · n new · d delete · r refresh · q quit"))
 
+	case modeCreate:
+		branch := m.input.Value()
+		b.WriteString("\n")
+		b.WriteString(helpStyle.Render("New worktree") + "\n")
+		b.WriteString("  Branch: " + m.input.View() + "\n")
+		if branch != "" {
+			preview := WorktreePath(m.repoDir, branch)
+			b.WriteString(pathStyle.Render(fmt.Sprintf("  Path:   %s", preview)) + "\n")
+		}
+		if m.err != nil {
+			b.WriteString(errStyle.Render(fmt.Sprintf("  error: %v", m.err)) + "\n")
+		}
+		b.WriteString(helpStyle.Render("enter to create · esc to cancel"))
+
 	case modeDeleteConfirm:
 		if len(m.worktrees) > 0 {
 			b.WriteString("\n")
 			b.WriteString(errStyle.Render(fmt.Sprintf("  Delete %s? (y/N)", m.worktrees[m.cursor].Path)))
+			b.WriteString("\n")
+			b.WriteString(helpStyle.Render("y yes · n/esc cancel"))
 		}
 
 	case modeDeleteForce:
@@ -326,7 +398,9 @@ func (m Model) View() string {
 				b.WriteString(errStyle.Render(fmt.Sprintf("  %v", m.err)))
 				b.WriteString("\n")
 			}
-			b.WriteString(errStyle.Render(fmt.Sprintf("  Uncommitted changes — force delete %s? (y/N)", m.worktrees[m.cursor].Path)))
+			b.WriteString(errStyle.Render(fmt.Sprintf("  Force delete %s? (y/N)", m.worktrees[m.cursor].Path)))
+			b.WriteString("\n")
+			b.WriteString(helpStyle.Render("y yes · n/esc cancel"))
 		}
 	}
 
