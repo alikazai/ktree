@@ -1,0 +1,39 @@
+version: 2
+
+project_name: ktree
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    main: .
+    binary: ktree
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+brews:
+  - name: ktree
+    repository:
+      owner: alikazai
+      name: homebrew-ktree
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/alikazai/ktree"
+    description: "Terminal UI for managing git worktrees"
+    install: |
+      bin.install "ktree"
+    test: |
+      system "#{bin}/ktree", "--init-shell", "bash"
