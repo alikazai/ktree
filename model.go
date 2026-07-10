@@ -136,6 +136,13 @@ func (m Model) loadStatus(wt Worktree) tea.Cmd {
 	}
 }
 
+func (m Model) deleteWorktree(wt Worktree, force bool) tea.Cmd {
+	return func() tea.Msg {
+		err := RemoveWorktree(m.repoDir, wt.Path, force)
+		return worktreeDeletedMsg{err: err, forced: force}
+	}
+}
+
 // --- Elm architecture: Init / Update / View -----------------------------
 
 // Init is called once when the program starts. Returning loadWorktrees here
@@ -175,32 +182,77 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statuses[msg.path] = msg.status
 		return m, nil
 
+	case worktreeDeletedMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			if !msg.forced {
+				// First attempt failed — offer force delete
+				m.mode = modeDeleteForce
+			} else {
+				// Force attempt also failed — give up, go back to list
+				m.mode = modeList
+			}
+			return m, nil
+		}
+		m.mode = modeList
+		m.err = nil
+		m.statuses = nil
+		return m, m.loadWorktrees
+
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c", "q":
+		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
-
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
-			}
-			return m, nil
-
-		case "down", "j":
-			if m.cursor < len(m.worktrees)-1 {
-				m.cursor++
-			}
-			return m, nil
-
-		case "r":
-			m.statuses = nil // clear stale dots immediately
-			return m, m.loadWorktrees
-
-		case "enter":
-			if len(m.worktrees) > 0 {
-				m.selected = m.worktrees[m.cursor].Path
+		}
+		switch m.mode {
+		case modeList:
+			switch msg.String() {
+			case "q":
 				return m, tea.Quit
+			case "up", "k":
+				if m.cursor > 0 {
+					m.cursor--
+				}
+			case "down", "j":
+				if m.cursor < len(m.worktrees)-1 {
+					m.cursor++
+				}
+			case "r":
+				m.statuses = nil
+				return m, m.loadWorktrees
+			case "enter":
+				if len(m.worktrees) > 0 {
+					m.selected = m.worktrees[m.cursor].Path
+					return m, tea.Quit
+				}
+			case "d":
+				if len(m.worktrees) > 0 {
+					m.mode = modeDeleteConfirm
+					m.err = nil
+				}
 			}
+			return m, nil
+
+		case modeDeleteConfirm:
+			switch msg.String() {
+			case "y", "Y":
+				wt := m.worktrees[m.cursor]
+				return m, m.deleteWorktree(wt, false)
+			case "n", "N", "esc":
+				m.mode = modeList
+				m.err = nil
+			}
+			return m, nil
+
+		case modeDeleteForce:
+			switch msg.String() {
+			case "y", "Y":
+				wt := m.worktrees[m.cursor]
+				return m, m.deleteWorktree(wt, true)
+			case "n", "N", "esc":
+				m.mode = modeList
+				m.err = nil
+			}
+			return m, nil
 		}
 	}
 
@@ -216,7 +268,7 @@ func (m Model) View() string {
 	b.WriteString(titleStyle.Render(fmt.Sprintf("Worktrees: %s", m.repoDir)))
 	b.WriteString("\n\n")
 
-	if m.err != nil {
+	if m.err != nil && m.mode == modeList {
 		b.WriteString(errStyle.Render(fmt.Sprintf("error: %v", m.err)))
 		b.WriteString("\n")
 	}
@@ -257,7 +309,26 @@ func (m Model) View() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(helpStyle.Render("↑/k up · ↓/j down · r refresh · q quit"))
+	switch m.mode {
+	case modeList:
+		b.WriteString(helpStyle.Render("↑/k up · ↓/j down · enter switch · n new · d delete · r refresh · q quit"))
+
+	case modeDeleteConfirm:
+		if len(m.worktrees) > 0 {
+			b.WriteString("\n")
+			b.WriteString(errStyle.Render(fmt.Sprintf("  Delete %s? (y/N)", m.worktrees[m.cursor].Path)))
+		}
+
+	case modeDeleteForce:
+		if len(m.worktrees) > 0 {
+			b.WriteString("\n")
+			if m.err != nil {
+				b.WriteString(errStyle.Render(fmt.Sprintf("  %v", m.err)))
+				b.WriteString("\n")
+			}
+			b.WriteString(errStyle.Render(fmt.Sprintf("  Uncommitted changes — force delete %s? (y/N)", m.worktrees[m.cursor].Path)))
+		}
+	}
 
 	return b.String()
 }
