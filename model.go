@@ -11,8 +11,18 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+)
+
+type viewMode int
+
+const (
+	modeList viewMode = iota
+	modeCreate
+	modeDeleteConfirm
+	modeDeleteForce
 )
 
 // Styling. Lipgloss styles are immutable and composable — define them once,
@@ -39,16 +49,29 @@ var (
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 )
 
+// worktreeStatus holds the per-worktree status fetched concurrently after the
+// worktree list loads.
+type worktreeStatus struct {
+	dirty       bool
+	ahead       int
+	behind      int
+	hasUpstream bool
+}
+
 // Model is the full state of the TUI at any point in time. Bubble Tea
 // re-renders View() from this struct on every Update — there's no
 // persistent widget tree to mutate.
 type Model struct {
 	repoDir   string
 	worktrees []Worktree
-	cursor    int   // index into worktrees of the currently highlighted row
-	err       error // last error, shown in the status line if non-nil
-	width     int   // terminal width, set on first WindowSizeMsg
+	statuses  map[string]worktreeStatus
+	cursor    int
+	err       error
+	width     int
 	height    int
+	mode      viewMode
+	input     textinput.Model
+	selected  string // path printed to stdout after quit (switch action)
 }
 
 // New constructs the initial model for a given repo directory. It does NOT
@@ -56,7 +79,10 @@ type Model struct {
 // fired from Init(), so the UI can render immediately and update once data
 // arrives rather than blocking startup on a subprocess call.
 func New(repoDir string) Model {
-	return Model{repoDir: repoDir}
+	ti := textinput.New()
+	ti.Placeholder = "feature/my-branch"
+	ti.CharLimit = 100
+	return Model{repoDir: repoDir, input: ti}
 }
 
 // --- Messages -----------------------------------------------------------
@@ -71,12 +97,43 @@ type worktreesLoadedMsg struct {
 	err       error
 }
 
+// statusLoadedMsg carries the status result for a single worktree.
+type statusLoadedMsg struct {
+	path   string
+	status worktreeStatus
+}
+
+type worktreeCreatedMsg struct{ err error }
+
+type worktreeDeletedMsg struct {
+	err    error
+	forced bool // true when this was a --force attempt
+}
+
 // loadWorktrees returns a tea.Cmd — a function Bubble Tea will run in the
 // background and turn into a Msg once it completes. This is how you do I/O
 // (subprocesses, network calls) without blocking the render loop.
 func (m Model) loadWorktrees() tea.Msg {
 	wts, err := List(m.repoDir)
 	return worktreesLoadedMsg{worktrees: wts, err: err}
+}
+
+// loadStatus fetches dirty/ahead-behind for a single worktree. It's called
+// once per worktree via tea.Batch so all statuses load concurrently.
+func (m Model) loadStatus(wt Worktree) tea.Cmd {
+	return func() tea.Msg {
+		dirty, _ := IsDirty(wt.Path)
+		ahead, behind, hasUpstream := AheadBehind(m.repoDir, wt.Branch)
+		return statusLoadedMsg{
+			path: wt.Path,
+			status: worktreeStatus{
+				dirty:       dirty,
+				ahead:       ahead,
+				behind:      behind,
+				hasUpstream: hasUpstream,
+			},
+		}
+	}
 }
 
 // --- Elm architecture: Init / Update / View -----------------------------
@@ -104,6 +161,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cursor >= len(m.worktrees) {
 			m.cursor = max(0, len(m.worktrees)-1)
 		}
+		m.statuses = make(map[string]worktreeStatus)
+		var cmds []tea.Cmd
+		for _, wt := range m.worktrees {
+			cmds = append(cmds, m.loadStatus(wt))
+		}
+		return m, tea.Batch(cmds...)
+
+	case statusLoadedMsg:
+		if m.statuses == nil {
+			m.statuses = make(map[string]worktreeStatus)
+		}
+		m.statuses[msg.path] = msg.status
 		return m, nil
 
 	case tea.KeyMsg:
@@ -124,8 +193,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "r":
-			// Re-run the git call. Milestone 3 will also refresh
-			// dirty/ahead-behind status here.
+			m.statuses = nil // clear stale dots immediately
 			return m, m.loadWorktrees
 		}
 	}
@@ -152,11 +220,27 @@ func (m Model) View() string {
 	}
 
 	for i, wt := range m.worktrees {
-		dot := cleanDot // Milestone 3 will swap this based on actual git status
-		line := fmt.Sprintf("%s  %-28s %s",
+		st, known := m.statuses[wt.Path]
+		var dot string
+		switch {
+		case !known:
+			dot = staleDot
+		case st.dirty:
+			dot = dirtyDot
+		default:
+			dot = cleanDot
+		}
+
+		syncInfo := ""
+		if known && st.hasUpstream {
+			syncInfo = fmt.Sprintf(" ↑%d ↓%d", st.ahead, st.behind)
+		}
+
+		line := fmt.Sprintf("%s  %-28s %s%s",
 			dot,
 			branchStyle.Render(wt.DisplayBranch()),
 			pathStyle.Render(wt.Path),
+			pathStyle.Render(syncInfo),
 		)
 
 		if i == m.cursor {
