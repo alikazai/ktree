@@ -5,6 +5,8 @@ import (
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"alikazai/ktree/internal/ui"
 )
 
 func main() {
@@ -19,14 +21,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(New(repoDir))
+	p := tea.NewProgram(ui.New(repoDir))
 	result, err := p.Run()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ktree:", err)
 		os.Exit(1)
 	}
-	if m, ok := result.(Model); ok && m.selected != "" {
-		fmt.Println(m.selected)
+	if m, ok := result.(ui.Model); ok && m.Selected() != "" {
+		fmt.Println(m.Selected())
 	}
 }
 
@@ -41,4 +43,3 @@ func printShellInit(shell string) {
 		os.Exit(1)
 	}
 }
-

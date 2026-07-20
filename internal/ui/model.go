@@ -1,11 +1,11 @@
-// Package ui implements the Bubble Tea terminal interface for wtree.
+// Package ui implements the Bubble Tea terminal interface for ktree.
 //
 // Bubble Tea follows The Elm Architecture: a single Model holds all state,
 // Update() is a pure function that takes a Msg and returns a new Model (plus
 // optional Cmd to run), and View() renders the Model to a string. There's no
 // direct mutation from event handlers like you'd see in a typical GUI
 // framework — everything flows through Update.
-package main
+package ui
 
 import (
 	"fmt"
@@ -13,7 +13,9 @@ import (
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+
+	"alikazai/ktree/internal/git"
+	"alikazai/ktree/internal/vault"
 )
 
 type viewMode int
@@ -23,30 +25,6 @@ const (
 	modeCreate
 	modeDeleteConfirm
 	modeDeleteForce
-)
-
-// Styling. Lipgloss styles are immutable and composable — define them once,
-// reuse everywhere. Keeping them at package level (not inside the model)
-// avoids rebuilding them every render.
-var (
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("212")).
-			Padding(0, 1)
-
-	selectedStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color("57")).
-			Foreground(lipgloss.Color("230")).
-			Bold(true)
-
-	cleanDot = lipgloss.NewStyle().Foreground(lipgloss.Color("76")).Render("●")  // green
-	dirtyDot = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("●") // amber
-	staleDot = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("○") // grey
-
-	branchStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
-	pathStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(1, 1, 0, 1)
-	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 )
 
 // worktreeStatus holds the per-worktree status fetched concurrently after the
@@ -62,16 +40,19 @@ type worktreeStatus struct {
 // re-renders View() from this struct on every Update — there's no
 // persistent widget tree to mutate.
 type Model struct {
-	repoDir   string
-	worktrees []Worktree
-	statuses  map[string]worktreeStatus
-	cursor    int
-	err       error
-	width     int
-	height    int
-	mode      viewMode
-	input     textinput.Model
-	selected  string // path printed to stdout after quit (switch action)
+	repoDir           string
+	worktrees         []git.Worktree
+	statuses          map[string]worktreeStatus
+	cursor            int
+	err               error
+	width             int
+	height            int
+	mode              viewMode
+	input             textinput.Model
+	selected          string // path printed to stdout after quit (switch action)
+	pendingBranch     string // branch held across the vault-copy-confirm → create → copy sequence
+	copyVaultOnCreate bool   // true when a vault copy should follow worktree creation
+	vaultModel        *vault.VaultModel
 }
 
 // New constructs the initial model for a given repo directory. It does NOT
@@ -85,73 +66,9 @@ func New(repoDir string) Model {
 	return Model{repoDir: repoDir, input: ti}
 }
 
-// --- Messages -----------------------------------------------------------
-//
-// In Bubble Tea, anything that happens asynchronously (subprocess finishing,
-// timer firing, network response) is represented as a Msg type and delivered
-// to Update(). This keeps Update() the single place state changes happen.
-
-// worktreesLoadedMsg carries the result of running `git worktree list`.
-type worktreesLoadedMsg struct {
-	worktrees []Worktree
-	err       error
-}
-
-// statusLoadedMsg carries the status result for a single worktree.
-type statusLoadedMsg struct {
-	path   string
-	status worktreeStatus
-}
-
-type worktreeCreatedMsg struct{ err error }
-
-type worktreeDeletedMsg struct {
-	err    error
-	forced bool // true when this was a --force attempt
-}
-
-// loadWorktrees returns a tea.Cmd — a function Bubble Tea will run in the
-// background and turn into a Msg once it completes. This is how you do I/O
-// (subprocesses, network calls) without blocking the render loop.
-func (m Model) loadWorktrees() tea.Msg {
-	wts, err := List(m.repoDir)
-	return worktreesLoadedMsg{worktrees: wts, err: err}
-}
-
-// loadStatus fetches dirty/ahead-behind for a single worktree. It's called
-// once per worktree via tea.Batch so all statuses load concurrently.
-func (m Model) loadStatus(wt Worktree) tea.Cmd {
-	return func() tea.Msg {
-		dirty, _ := IsDirty(wt.Path)
-		ahead, behind, hasUpstream := AheadBehind(m.repoDir, wt.Branch)
-		return statusLoadedMsg{
-			path: wt.Path,
-			status: worktreeStatus{
-				dirty:       dirty,
-				ahead:       ahead,
-				behind:      behind,
-				hasUpstream: hasUpstream,
-			},
-		}
-	}
-}
-
-func (m Model) deleteWorktree(wt Worktree, force bool) tea.Cmd {
-	return func() tea.Msg {
-		err := RemoveWorktree(m.repoDir, wt.Path, force)
-		return worktreeDeletedMsg{err: err, forced: force}
-	}
-}
-
-func (m Model) createWorktree(branch string) tea.Cmd {
-	return func() tea.Msg {
-		path := WorktreePath(m.repoDir, branch)
-		err := AddWorktree(m.repoDir, path, branch)
-		return worktreeCreatedMsg{err: err}
-	}
-}
-
-// --- Elm architecture: Init / Update / View -----------------------------
+// Selected returns the worktree path chosen by the user (switch action),
+// or "" if the user quit without selecting.
+func (m Model) Selected() string { return m.selected }
 
 // Init is called once when the program starts. Returning loadWorktrees here
 // kicks off the initial git call without blocking the first render.
@@ -163,6 +80,33 @@ func (m Model) Init() tea.Cmd {
 // plus an optional command to run next. This is the only place model
 // fields should change.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// When the vault sub-model is active it owns the screen. ctrl+c is
+	// intercepted first so quit always works regardless of vault state.
+	if m.vaultModel != nil {
+		if key, ok := msg.(tea.KeyMsg); ok && key.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+		updated, cmd := m.vaultModel.Update(msg)
+		m.vaultModel = &updated
+		if m.vaultModel.Done() {
+			shouldCopy := m.vaultModel.ShouldCopy()
+			if err := m.vaultModel.Err(); err != nil {
+				m.err = err
+			}
+			m.vaultModel = nil
+			if shouldCopy {
+				m.copyVaultOnCreate = true
+			}
+			if m.pendingBranch != "" {
+				// Copy-confirm flow: create the worktree now that user has responded.
+				return m, m.createWorktree(m.pendingBranch)
+			}
+			// Init flow: return to the list.
+			return m, m.loadWorktrees
+		}
+		return m, cmd
+	}
+
 	// In create mode, handle window size and key messages. Everything else
 	// (including worktreeCreatedMsg) falls through to the main switch.
 	if m.mode == modeCreate {
@@ -186,6 +130,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				m.input.Blur()
+				if vault.VaultExists(m.repoDir) {
+					m.pendingBranch = branch
+					v := vault.NewCopyConfirmFlow(m.repoDir, branch)
+					m.vaultModel = &v
+					m.mode = modeList
+					return m, m.vaultModel.Init()
+				}
 				return m, m.createWorktree(branch)
 			default:
 				var cmd tea.Cmd
@@ -244,12 +195,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case worktreeCreatedMsg:
 		if msg.err != nil {
 			m.err = msg.err
+			m.mode = modeCreate
 			m.input.Focus()
 			return m, textinput.Blink
+		}
+		if m.copyVaultOnCreate {
+			m.copyVaultOnCreate = false
+			return m, m.copyVault(git.WorktreePath(m.repoDir, m.pendingBranch))
 		}
 		m.mode = modeList
 		m.err = nil
 		m.statuses = nil
+		m.pendingBranch = ""
+		return m, m.loadWorktrees
+
+	case vaultCopiedMsg:
+		m.mode = modeList
+		m.pendingBranch = ""
+		m.statuses = nil
+		if msg.err != nil {
+			m.err = msg.err
+		}
 		return m, m.loadWorktrees
 
 	case tea.KeyMsg:
@@ -288,6 +254,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.SetValue("")
 				m.input.Focus()
 				return m, textinput.Blink
+			case "v":
+				m.err = nil
+				v := vault.NewInitFlow(m.repoDir)
+				m.vaultModel = &v
+				return m, m.vaultModel.Init()
 			}
 			return m, nil
 
@@ -322,6 +293,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // after every Update and redraws the terminal with the result — you never
 // write to the terminal directly.
 func (m Model) View() string {
+	if m.vaultModel != nil {
+		return m.vaultModel.View()
+	}
+
 	var b strings.Builder
 
 	b.WriteString(titleStyle.Render(fmt.Sprintf("Worktrees: %s", m.repoDir)))
@@ -370,7 +345,7 @@ func (m Model) View() string {
 
 	switch m.mode {
 	case modeList:
-		b.WriteString(helpStyle.Render("↑/k up · ↓/j down · enter switch · n new · d delete · r refresh · q quit"))
+		b.WriteString(helpStyle.Render("↑/k up · ↓/j down · enter switch · n new · d delete · r refresh · v vault · q quit"))
 
 	case modeCreate:
 		branch := m.input.Value()
@@ -378,7 +353,7 @@ func (m Model) View() string {
 		b.WriteString(helpStyle.Render("New worktree") + "\n")
 		b.WriteString("  Branch: " + m.input.View() + "\n")
 		if branch != "" {
-			preview := WorktreePath(m.repoDir, branch)
+			preview := git.WorktreePath(m.repoDir, branch)
 			b.WriteString(pathStyle.Render(fmt.Sprintf("  Path:   %s", preview)) + "\n")
 		}
 		if m.err != nil {
@@ -409,4 +384,3 @@ func (m Model) View() string {
 
 	return b.String()
 }
-
