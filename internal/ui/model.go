@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -36,6 +37,20 @@ type worktreeStatus struct {
 	hasUpstream bool
 }
 
+type operationKind int
+
+const (
+	operationCreate operationKind = iota
+	operationDelete
+	operationCopyVault
+)
+
+type pendingOperation struct {
+	kind   operationKind
+	label  string
+	target string
+}
+
 // Model is the full state of the TUI at any point in time. Bubble Tea
 // re-renders View() from this struct on every Update — there's no
 // persistent widget tree to mutate.
@@ -45,10 +60,13 @@ type Model struct {
 	statuses          map[string]worktreeStatus
 	cursor            int
 	err               error
+	bannerErr         error
 	width             int
 	height            int
 	mode              viewMode
 	input             textinput.Model
+	spinner           spinner.Model
+	pending           *pendingOperation
 	selected          string // path printed to stdout after quit (switch action)
 	pendingBranch     string // branch held across the vault-copy-confirm → create → copy sequence
 	copyVaultOnCreate bool   // true when a vault copy should follow worktree creation
@@ -63,7 +81,9 @@ func New(repoDir string) Model {
 	ti := textinput.New()
 	ti.Placeholder = "feature/my-branch"
 	ti.CharLimit = 100
-	return Model{repoDir: repoDir, input: ti}
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	return Model{repoDir: repoDir, input: ti, spinner: sp}
 }
 
 // Selected returns the worktree path chosen by the user (switch action),
@@ -76,10 +96,30 @@ func (m Model) Init() tea.Cmd {
 	return m.loadWorktrees
 }
 
+func (m *Model) startPendingOperation(kind operationKind, label, target string) {
+	m.pending = &pendingOperation{kind: kind, label: label, target: target}
+	m.bannerErr = nil
+	m.err = nil
+}
+
 // Update handles every incoming message and returns the new model state
 // plus an optional command to run next. This is the only place model
 // fields should change.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.pending != nil {
+		switch msg := msg.(type) {
+		case spinner.TickMsg:
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			return m, cmd
+		case tea.KeyMsg:
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			return m, nil
+		}
+	}
+
 	// When the vault sub-model is active it owns the screen. ctrl+c is
 	// intercepted first so quit always works regardless of vault state.
 	if m.vaultModel != nil {
@@ -92,14 +132,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			shouldCopy := m.vaultModel.ShouldCopy()
 			if err := m.vaultModel.Err(); err != nil {
 				m.err = err
+				m.bannerErr = err
 			}
 			m.vaultModel = nil
-			if shouldCopy {
-				m.copyVaultOnCreate = true
-			}
+			m.copyVaultOnCreate = shouldCopy
 			if m.pendingBranch != "" {
 				// Copy-confirm flow: create the worktree now that user has responded.
-				return m, m.createWorktree(m.pendingBranch)
+				m.startPendingOperation(operationCreate, "Creating worktree...", m.pendingBranch)
+				return m, tea.Batch(m.spinner.Tick, m.createWorktree(m.pendingBranch))
 			}
 			// Init flow: return to the list.
 			return m, m.loadWorktrees
@@ -116,12 +156,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.height = msg.Height
 			return m, nil
 		case tea.KeyMsg:
+			if msg.String() != "ctrl+c" {
+				m.bannerErr = nil
+			}
 			switch msg.String() {
 			case "ctrl+c":
 				return m, tea.Quit
 			case "esc":
 				m.mode = modeList
 				m.err = nil
+				m.bannerErr = nil
 				m.input.Blur()
 				return m, nil
 			case "enter":
@@ -137,7 +181,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.mode = modeList
 					return m, m.vaultModel.Init()
 				}
-				return m, m.createWorktree(branch)
+				m.startPendingOperation(operationCreate, "Creating worktree...", branch)
+				return m, tea.Batch(m.spinner.Tick, m.createWorktree(branch))
 			default:
 				var cmd tea.Cmd
 				m.input, cmd = m.input.Update(msg)
@@ -157,7 +202,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case worktreesLoadedMsg:
 		m.worktrees = msg.worktrees
-		m.err = msg.err
+		if m.mode == modeList {
+			m.err = msg.err
+		}
+		if msg.err != nil && m.bannerErr == nil {
+			m.bannerErr = msg.err
+		}
 		if m.cursor >= len(m.worktrees) {
 			m.cursor = max(0, len(m.worktrees)-1)
 		}
@@ -176,8 +226,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case worktreeDeletedMsg:
+		m.pending = nil
 		if msg.err != nil {
 			m.err = msg.err
+			m.bannerErr = msg.err
 			if !msg.forced {
 				// First attempt failed — offer force delete
 				m.mode = modeDeleteForce
@@ -189,32 +241,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.mode = modeList
 		m.err = nil
+		m.bannerErr = nil
 		m.statuses = nil
 		return m, m.loadWorktrees
 
 	case worktreeCreatedMsg:
+		m.pending = nil
 		if msg.err != nil {
 			m.err = msg.err
+			m.bannerErr = msg.err
 			m.mode = modeCreate
 			m.input.Focus()
 			return m, textinput.Blink
 		}
 		if m.copyVaultOnCreate {
 			m.copyVaultOnCreate = false
-			return m, m.copyVault(git.WorktreePath(m.repoDir, m.pendingBranch))
+			m.startPendingOperation(operationCopyVault, "Copying vault...", git.WorktreePath(m.repoDir, m.pendingBranch))
+			return m, tea.Batch(m.spinner.Tick, m.copyVault(git.WorktreePath(m.repoDir, m.pendingBranch)))
 		}
 		m.mode = modeList
 		m.err = nil
+		m.bannerErr = nil
 		m.statuses = nil
 		m.pendingBranch = ""
 		return m, m.loadWorktrees
 
 	case vaultCopiedMsg:
+		m.pending = nil
 		m.mode = modeList
 		m.pendingBranch = ""
 		m.statuses = nil
 		if msg.err != nil {
 			m.err = msg.err
+			m.bannerErr = msg.err
+		} else {
+			m.err = nil
+			m.bannerErr = nil
 		}
 		return m, m.loadWorktrees
 
@@ -222,6 +284,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
+		m.bannerErr = nil
 		switch m.mode {
 		case modeList:
 			switch msg.String() {
@@ -236,6 +299,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.cursor++
 				}
 			case "r":
+				m.bannerErr = nil
 				m.statuses = nil
 				return m, m.loadWorktrees
 			case "enter":
@@ -247,15 +311,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(m.worktrees) > 0 {
 					m.mode = modeDeleteConfirm
 					m.err = nil
+					m.bannerErr = nil
 				}
 			case "n":
 				m.mode = modeCreate
 				m.err = nil
+				m.bannerErr = nil
 				m.input.SetValue("")
 				m.input.Focus()
 				return m, textinput.Blink
 			case "v":
 				m.err = nil
+				m.bannerErr = nil
 				v := vault.NewInitFlow(m.repoDir)
 				m.vaultModel = &v
 				return m, m.vaultModel.Init()
@@ -266,10 +333,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "y", "Y":
 				wt := m.worktrees[m.cursor]
-				return m, m.deleteWorktree(wt, false)
+				m.startPendingOperation(operationDelete, "Deleting worktree...", wt.Path)
+				return m, tea.Batch(m.spinner.Tick, m.deleteWorktree(wt, false))
 			case "n", "N", "esc":
 				m.mode = modeList
 				m.err = nil
+				m.bannerErr = nil
 			}
 			return m, nil
 
@@ -277,10 +346,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "y", "Y":
 				wt := m.worktrees[m.cursor]
-				return m, m.deleteWorktree(wt, true)
+				m.startPendingOperation(operationDelete, "Deleting worktree...", wt.Path)
+				return m, tea.Batch(m.spinner.Tick, m.deleteWorktree(wt, true))
 			case "n", "N", "esc":
 				m.mode = modeList
 				m.err = nil
+				m.bannerErr = nil
 			}
 			return m, nil
 		}
@@ -302,8 +373,8 @@ func (m Model) View() string {
 	b.WriteString(titleStyle.Render(fmt.Sprintf("Worktrees: %s", m.repoDir)))
 	b.WriteString("\n\n")
 
-	if m.err != nil && m.mode == modeList {
-		b.WriteString(errStyle.Render(fmt.Sprintf("error: %v", m.err)))
+	if m.bannerErr != nil {
+		b.WriteString(errStyle.Render(fmt.Sprintf("error: %v", m.bannerErr)))
 		b.WriteString("\n")
 	}
 
@@ -341,6 +412,18 @@ func (m Model) View() string {
 			b.WriteString("  " + line)
 		}
 		b.WriteString("\n")
+	}
+
+	if m.pending != nil {
+		b.WriteString("\n")
+		b.WriteString(busyStyle.Render(fmt.Sprintf("  %s %s", m.spinner.View(), m.pending.label)))
+		b.WriteString("\n")
+		if m.pending.target != "" {
+			b.WriteString(pathStyle.Render(fmt.Sprintf("  %s", m.pending.target)))
+			b.WriteString("\n")
+		}
+		b.WriteString(helpStyle.Render("working..."))
+		return b.String()
 	}
 
 	switch m.mode {

@@ -20,5 +20,6 @@ var (
 	branchStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
 	pathStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(1, 1, 0, 1)
+	busyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
 	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 )

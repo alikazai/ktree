@@ -71,9 +71,13 @@ Press `n`, type a branch name, and press `enter`. New worktrees are created at:
 
 For example, branch `feature/auth` in repo `~/code/myapp` → `~/code/myapp-worktrees/feature-auth`.
 
+While creation is running, ktree keeps the list visible and shows a bold in-progress status so it is clear the command is still working.
+
 ### Deleting a worktree
 
 Press `d` and confirm with `y`. If the worktree has uncommitted changes, ktree shows a second prompt offering a force delete.
+
+While deletion is running, ktree shows the same in-progress feedback. If create/delete fails, ktree restores the relevant prompt and keeps a visible error banner until your next action.
 
 ## Project structure
 
