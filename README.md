@@ -34,6 +34,29 @@ Worktrees: /home/ali/code/myapp
 
 **Dot legend:** `●` green = clean, `●` amber = uncommitted changes, `○` grey = loading
 
+### Install bundled skills
+
+`ktree` also ships a bundled `ktree` skill installer for supported agent CLIs.
+
+```bash
+# open the chooser and install into a detected target
+ktree install skill
+
+# install directly into a specific target
+ktree install skill claude
+ktree install skill opencode
+
+# print the managed artifact instead of writing it
+ktree install skill codex --export
+
+# install into every detected target and print a summary
+ktree install skill --all
+```
+
+Supported targets currently include Claude, OpenCode, Codex, Grok, and Cursor when their config location or binary is detected.
+
+The chooser shows each detected target with its current status (`current`, `outdated`, `modified`, `unmanaged`, or `not installed`). `--all` installs across every detected target, reports successes and per-target failures in target order, and returns an error when nothing supported is detected.
+
 ### Keys
 
 | Key | Action |
