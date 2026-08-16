@@ -25,16 +25,13 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
-brews:
+homebrew_casks:
   - name: ktree
-    directory: Formula
     repository:
       owner: alikazai
       name: homebrew-ktree
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: "https://github.com/alikazai/ktree"
     description: "Terminal UI for managing git worktrees"
-    install: |
-      bin.install "ktree"
-    test: |
-      system "#{bin}/ktree", "--init-shell", "bash"
+    binaries:
+      - ktree
