@@ -8,11 +8,15 @@ type worktreesLoadedMsg struct {
 }
 
 type statusLoadedMsg struct {
-	path   string
-	status worktreeStatus
+	path       string
+	status     worktreeStatus
+	dirtyKnown bool
+	probeErr   error
 }
 
 type worktreeCreatedMsg struct{ err error }
+
+type worktreePulledMsg struct{ err error }
 
 type worktreeDeletedMsg struct {
 	err    error

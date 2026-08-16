@@ -18,6 +18,7 @@ var (
 	staleDot = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("○") // grey
 
 	branchStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+	headerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Bold(true)
 	pathStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(1, 1, 0, 1)
 	busyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)

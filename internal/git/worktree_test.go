@@ -1,6 +1,12 @@
 package git
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+)
 
 func TestParsePorcelain(t *testing.T) {
 	input := `worktree /home/ali/code/jurii
@@ -111,5 +117,68 @@ func TestWorktreePath(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("WorktreePath(%q, %q) = %q, want %q", tc.repoDir, tc.branch, got, tc.want)
 		}
+	}
+}
+
+func TestAddWorktreeFromBase(t *testing.T) {
+	repoDir := t.TempDir()
+	worktreePath := filepath.Join(t.TempDir(), "feature-child")
+	argvFile, cwdFile := installFakeGit(t)
+
+	if err := AddWorktreeFromBase(repoDir, worktreePath, "feature/child", "feature/base"); err != nil {
+		t.Fatalf("AddWorktreeFromBase() error = %v", err)
+	}
+
+	assertGitInvocation(t, argvFile, cwdFile, []string{"worktree", "add", worktreePath, "-b", "feature/child", "feature/base"}, repoDir)
+}
+
+func TestPullWorktree(t *testing.T) {
+	worktreePath := t.TempDir()
+	argvFile, cwdFile := installFakeGit(t)
+
+	if err := PullWorktree(worktreePath); err != nil {
+		t.Fatalf("PullWorktree() error = %v", err)
+	}
+
+	assertGitInvocation(t, argvFile, cwdFile, []string{"pull"}, worktreePath)
+}
+
+func installFakeGit(t *testing.T) (argvFile string, cwdFile string) {
+	t.Helper()
+
+	binDir := t.TempDir()
+	argvFile = filepath.Join(binDir, "git-argv")
+	cwdFile = filepath.Join(binDir, "git-cwd")
+	gitPath := filepath.Join(binDir, "git")
+	script := "#!/bin/sh\npwd >\"$FAKE_GIT_CWD_FILE\"\nprintf '%s\\n' \"$@\" >\"$FAKE_GIT_ARGV_FILE\"\nexit 0\n"
+	if err := os.WriteFile(gitPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("os.WriteFile(%q): %v", gitPath, err)
+	}
+
+	t.Setenv("FAKE_GIT_ARGV_FILE", argvFile)
+	t.Setenv("FAKE_GIT_CWD_FILE", cwdFile)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	return argvFile, cwdFile
+}
+
+func assertGitInvocation(t *testing.T, argvFile, cwdFile string, wantArgs []string, wantDir string) {
+	t.Helper()
+
+	argvBytes, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q): %v", argvFile, err)
+	}
+	cwdBytes, err := os.ReadFile(cwdFile)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q): %v", cwdFile, err)
+	}
+
+	gotArgs := strings.Split(strings.TrimSpace(string(argvBytes)), "\n")
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("git argv = %#v, want %#v", gotArgs, wantArgs)
+	}
+	if gotDir := strings.TrimSpace(string(cwdBytes)); gotDir != wantDir {
+		t.Fatalf("git cwd = %q, want %q", gotDir, wantDir)
 	}
 }

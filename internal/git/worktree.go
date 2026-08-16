@@ -184,6 +184,23 @@ func AddWorktree(repoDir, path, branch string) error {
 	return nil
 }
 
+func addWorktreeFromBaseArgs(path, branch, baseRef string) []string {
+	return []string{"worktree", "add", path, "-b", branch, baseRef}
+}
+
+// AddWorktreeFromBase runs `git worktree add <path> -b <branch> <baseRef>` in repoDir.
+// Returns an error (including git's stderr) if the command fails.
+func AddWorktreeFromBase(repoDir, path, branch, baseRef string) error {
+	cmd := exec.Command("git", addWorktreeFromBaseArgs(path, branch, baseRef)...)
+	cmd.Dir = repoDir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
 // RemoveWorktree runs `git worktree remove [--force] <path>` in repoDir.
 func RemoveWorktree(repoDir, path string, force bool) error {
 	args := []string{"worktree", "remove"}
@@ -193,6 +210,22 @@ func RemoveWorktree(repoDir, path string, force bool) error {
 	args = append(args, path)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repoDir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+func pullWorktreeArgs() []string {
+	return []string{"pull"}
+}
+
+// PullWorktree runs `git pull` in the given worktree path.
+func PullWorktree(worktreePath string) error {
+	cmd := exec.Command("git", pullWorktreeArgs()...)
+	cmd.Dir = worktreePath
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

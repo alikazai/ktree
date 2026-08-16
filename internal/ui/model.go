@@ -10,13 +10,29 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"alikazai/ktree/internal/git"
 	"alikazai/ktree/internal/vault"
+)
+
+const (
+	tableBranchWidth = 28
+	tableStateWidth  = 8
+	tableSyncWidth   = 12
+	tablePrefixWidth = 5
+	tableBranchMin   = 12
+	tableBranchTight = 4
+	tableStateTight  = 5
+	tableSyncTight   = 5
+	tablePathTight   = 28
+	tablePathMin     = 1
 )
 
 type viewMode int
@@ -24,6 +40,7 @@ type viewMode int
 const (
 	modeList viewMode = iota
 	modeCreate
+	modeCreateFromSelected
 	modeDeleteConfirm
 	modeDeleteForce
 )
@@ -41,6 +58,7 @@ type operationKind int
 
 const (
 	operationCreate operationKind = iota
+	operationPull
 	operationDelete
 	operationCopyVault
 )
@@ -58,6 +76,7 @@ type Model struct {
 	repoDir           string
 	worktrees         []git.Worktree
 	statuses          map[string]worktreeStatus
+	statusProbeErrs   map[string]error
 	cursor            int
 	err               error
 	bannerErr         error
@@ -70,6 +89,7 @@ type Model struct {
 	selected          string // path printed to stdout after quit (switch action)
 	pendingBranch     string // branch held across the vault-copy-confirm → create → copy sequence
 	copyVaultOnCreate bool   // true when a vault copy should follow worktree creation
+	selectedBase      git.Worktree
 	vaultModel        *vault.VaultModel
 }
 
@@ -100,6 +120,56 @@ func (m *Model) startPendingOperation(kind operationKind, label, target string) 
 	m.pending = &pendingOperation{kind: kind, label: label, target: target}
 	m.bannerErr = nil
 	m.err = nil
+}
+
+func (m Model) selectedWorktree() (git.Worktree, bool) {
+	if len(m.worktrees) == 0 || m.cursor < 0 || m.cursor >= len(m.worktrees) {
+		return git.Worktree{}, false
+	}
+	return m.worktrees[m.cursor], true
+}
+
+func errProbeFailed(path, cause string) error {
+	return fmt.Errorf("worktree status probe failed for %s: %s", path, cause)
+}
+
+func (m Model) selectedStatusForAction(wt git.Worktree, action string) (worktreeStatus, error) {
+	if err := m.statusProbeErrs[wt.Path]; err != nil {
+		return worktreeStatus{}, fmt.Errorf("cannot %s: %w", action, err)
+	}
+	st, known := m.statuses[wt.Path]
+	if !known {
+		return worktreeStatus{}, fmt.Errorf("cannot %s while worktree status is still loading", action)
+	}
+	return st, nil
+}
+
+func (m Model) canBranchFromSelected(wt git.Worktree) error {
+	st, err := m.selectedStatusForAction(wt, "branch")
+	if err != nil {
+		return err
+	}
+	if st.dirty {
+		return fmt.Errorf("cannot branch from dirty worktree")
+	}
+	return nil
+}
+
+func (m Model) canPullSelected(wt git.Worktree) error {
+	st, err := m.selectedStatusForAction(wt, "pull")
+	if err != nil {
+		return err
+	}
+	if st.dirty {
+		return fmt.Errorf("cannot pull dirty worktree")
+	}
+	if wt.Branch == "" {
+		return fmt.Errorf("cannot pull detached worktree")
+	}
+	if !st.hasUpstream {
+		return fmt.Errorf("cannot pull worktree without upstream")
+	}
+	return nil
 }
 
 // Update handles every incoming message and returns the new model state
@@ -149,7 +219,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// In create mode, handle window size and key messages. Everything else
 	// (including worktreeCreatedMsg) falls through to the main switch.
-	if m.mode == modeCreate {
+	if m.mode == modeCreate || m.mode == modeCreateFromSelected {
 		switch msg := msg.(type) {
 		case tea.WindowSizeMsg:
 			m.width = msg.Width
@@ -166,12 +236,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mode = modeList
 				m.err = nil
 				m.bannerErr = nil
+				m.selectedBase = git.Worktree{}
 				m.input.Blur()
 				return m, nil
 			case "enter":
 				branch := strings.TrimSpace(m.input.Value())
 				if branch == "" {
 					return m, nil
+				}
+				if m.mode == modeCreateFromSelected {
+					baseRef := m.selectedBase.Branch
+					if baseRef == "" {
+						baseRef = m.selectedBase.Head
+					}
+					if baseRef == "" {
+						return m, nil
+					}
+					m.input.Blur()
+					m.startPendingOperation(operationCreate, "Creating worktree...", branch)
+					return m, tea.Batch(m.spinner.Tick, m.createWorktreeFromSelected(m.selectedBase, branch))
 				}
 				m.input.Blur()
 				if vault.VaultExists(m.repoDir) {
@@ -212,6 +295,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursor = max(0, len(m.worktrees)-1)
 		}
 		m.statuses = make(map[string]worktreeStatus)
+		m.statusProbeErrs = make(map[string]error)
 		var cmds []tea.Cmd
 		for _, wt := range m.worktrees {
 			cmds = append(cmds, m.loadStatus(wt))
@@ -222,7 +306,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.statuses == nil {
 			m.statuses = make(map[string]worktreeStatus)
 		}
+		if m.statusProbeErrs == nil {
+			m.statusProbeErrs = make(map[string]error)
+		}
+		if !msg.dirtyKnown {
+			delete(m.statuses, msg.path)
+			if msg.probeErr != nil {
+				m.statusProbeErrs[msg.path] = msg.probeErr
+			} else {
+				delete(m.statusProbeErrs, msg.path)
+			}
+			return m, nil
+		}
 		m.statuses[msg.path] = msg.status
+		delete(m.statusProbeErrs, msg.path)
 		return m, nil
 
 	case worktreeDeletedMsg:
@@ -243,6 +340,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = nil
 		m.bannerErr = nil
 		m.statuses = nil
+		m.statusProbeErrs = nil
 		return m, m.loadWorktrees
 
 	case worktreeCreatedMsg:
@@ -250,7 +348,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.err = msg.err
 			m.bannerErr = msg.err
-			m.mode = modeCreate
+			if m.mode != modeCreateFromSelected {
+				m.mode = modeCreate
+			}
 			m.input.Focus()
 			return m, textinput.Blink
 		}
@@ -263,7 +363,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = nil
 		m.bannerErr = nil
 		m.statuses = nil
+		m.statusProbeErrs = nil
 		m.pendingBranch = ""
+		m.selectedBase = git.Worktree{}
+		return m, m.loadWorktrees
+
+	case worktreePulledMsg:
+		m.pending = nil
+		if msg.err != nil {
+			m.err = msg.err
+			m.bannerErr = msg.err
+			m.mode = modeList
+			return m, nil
+		}
+		m.mode = modeList
+		m.err = nil
+		m.bannerErr = nil
+		m.statuses = nil
+		m.statusProbeErrs = nil
 		return m, m.loadWorktrees
 
 	case vaultCopiedMsg:
@@ -271,6 +388,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = modeList
 		m.pendingBranch = ""
 		m.statuses = nil
+		m.statusProbeErrs = nil
 		if msg.err != nil {
 			m.err = msg.err
 			m.bannerErr = msg.err
@@ -301,6 +419,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "r":
 				m.bannerErr = nil
 				m.statuses = nil
+				m.statusProbeErrs = nil
 				return m, m.loadWorktrees
 			case "enter":
 				if len(m.worktrees) > 0 {
@@ -317,9 +436,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mode = modeCreate
 				m.err = nil
 				m.bannerErr = nil
+				m.selectedBase = git.Worktree{}
 				m.input.SetValue("")
 				m.input.Focus()
 				return m, textinput.Blink
+			case "b":
+				wt, ok := m.selectedWorktree()
+				if !ok {
+					return m, nil
+				}
+				if err := m.canBranchFromSelected(wt); err != nil {
+					m.err = err
+					m.bannerErr = err
+					return m, nil
+				}
+				m.mode = modeCreateFromSelected
+				m.err = nil
+				m.bannerErr = nil
+				m.pendingBranch = ""
+				m.copyVaultOnCreate = false
+				m.selectedBase = wt
+				m.input.SetValue(wt.Branch)
+				m.input.Focus()
+				return m, textinput.Blink
+			case "p":
+				wt, ok := m.selectedWorktree()
+				if !ok {
+					return m, nil
+				}
+				if err := m.canPullSelected(wt); err != nil {
+					m.err = err
+					m.bannerErr = err
+					return m, nil
+				}
+				m.startPendingOperation(operationPull, "Pulling worktree...", wt.Path)
+				return m, tea.Batch(m.spinner.Tick, m.pullWorktree(wt))
 			case "v":
 				m.err = nil
 				m.bannerErr = nil
@@ -360,6 +511,164 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func stateLabel(st worktreeStatus, known bool) string {
+	if !known {
+		return "loading"
+	}
+	if st.dirty {
+		return "dirty"
+	}
+	return "clean"
+}
+
+func syncLabel(st worktreeStatus, known bool) string {
+	if !known || !st.hasUpstream {
+		return "-"
+	}
+	return fmt.Sprintf("↑%d ↓%d", st.ahead, st.behind)
+}
+
+func fitTableCell(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+
+	text = ansi.Truncate(text, width, "")
+	padding := width - lipgloss.Width(text)
+	if padding <= 0 {
+		return text
+	}
+	return text + strings.Repeat(" ", padding)
+}
+
+func truncatePathStart(path string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(path) <= width {
+		return path
+	}
+	if width <= 3 {
+		return strings.Repeat(".", width)
+	}
+
+	trimmed := path
+	for lipgloss.Width("..."+trimmed) > width && len(trimmed) > 0 {
+		_, size := utf8.DecodeRuneInString(trimmed)
+		trimmed = trimmed[size:]
+	}
+	if !strings.HasPrefix(trimmed, "/") {
+		if slash := strings.Index(trimmed, "/"); slash > 0 {
+			candidate := trimmed[slash:]
+			if lipgloss.Width("..."+candidate) <= width {
+				trimmed = candidate
+			}
+		}
+	}
+
+	return "..." + trimmed
+}
+
+func useNarrowPathStartTruncation(pathWidth int) bool {
+	return pathWidth > 0 && pathWidth < tablePathTight
+}
+
+func tableWidth(total int) int {
+	if total <= 0 {
+		return 80
+	}
+	return total
+}
+
+func shrinkWidth(width *int, minWidth int, deficit *int) {
+	if *deficit <= 0 || *width <= minWidth {
+		return
+	}
+
+	shrink := min(*deficit, *width-minWidth)
+	*width -= shrink
+	*deficit -= shrink
+}
+
+func tableColumnWidths(total int) (branchWidth, stateWidth, syncWidth, pathWidth int) {
+	branchWidth = tableBranchWidth
+	stateWidth = tableStateWidth
+	syncWidth = tableSyncWidth
+
+	available := tableWidth(total) - tablePrefixWidth - 3
+	pathWidth = available - branchWidth - stateWidth - syncWidth
+	if pathWidth >= tablePathMin {
+		return branchWidth, stateWidth, syncWidth, pathWidth
+	}
+
+	deficit := tablePathMin - pathWidth
+	shrinkWidth(&branchWidth, tableBranchMin, &deficit)
+	shrinkWidth(&stateWidth, tableStateTight, &deficit)
+	shrinkWidth(&syncWidth, tableSyncTight, &deficit)
+	shrinkWidth(&branchWidth, tableBranchTight, &deficit)
+	shrinkWidth(&stateWidth, 1, &deficit)
+	shrinkWidth(&syncWidth, 1, &deficit)
+	shrinkWidth(&branchWidth, 1, &deficit)
+	shrinkWidth(&stateWidth, 0, &deficit)
+	shrinkWidth(&syncWidth, 0, &deficit)
+	shrinkWidth(&branchWidth, 0, &deficit)
+
+	pathWidth = available - branchWidth - stateWidth - syncWidth
+	if pathWidth < 0 {
+		pathWidth = 0
+	}
+
+	return branchWidth, stateWidth, syncWidth, pathWidth
+}
+
+func useCompactTableFallback(total, branchWidth, stateWidth, syncWidth, pathWidth int) bool {
+	if total <= 0 {
+		return false
+	}
+
+	return branchWidth < tableBranchTight ||
+		stateWidth < tableStateTight ||
+		syncWidth < tableSyncTight ||
+		pathWidth <= 0
+}
+
+func renderTinyTableRow(total int, selected bool, dot string, primary string) string {
+	remaining := total
+	if remaining <= 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	if remaining == 1 {
+		if selected {
+			b.WriteString(">")
+		} else {
+			b.WriteString(" ")
+		}
+		remaining--
+	} else if remaining > 1 {
+		if selected {
+			b.WriteString("> ")
+		} else {
+			b.WriteString("  ")
+		}
+		remaining -= 2
+	}
+	if remaining > 0 {
+		b.WriteString(dot)
+		remaining--
+	}
+	if remaining > 0 {
+		b.WriteString(fitTableCell(primary, remaining))
+	}
+
+	row := b.String()
+	if selected {
+		return selectedStyle.Render(row)
+	}
+	return row
+}
+
 // View renders the current model state to a string. Bubble Tea calls this
 // after every Update and redraws the terminal with the result — you never
 // write to the terminal directly.
@@ -382,36 +691,56 @@ func (m Model) View() string {
 		b.WriteString(pathStyle.Render("  loading...\n"))
 	}
 
-	for i, wt := range m.worktrees {
-		st, known := m.statuses[wt.Path]
-		var dot string
-		switch {
-		case !known:
-			dot = staleDot
-		case st.dirty:
-			dot = dirtyDot
-		default:
-			dot = cleanDot
+	if len(m.worktrees) > 0 {
+		branchWidth, stateWidth, syncWidth, pathWidth := tableColumnWidths(m.width)
+		// Fall back once the condensed table drops below the minimum readable widths.
+		tinyTable := useCompactTableFallback(m.width, branchWidth, stateWidth, syncWidth, pathWidth)
+		if !tinyTable {
+			header := strings.Repeat(" ", tablePrefixWidth) +
+				fitTableCell("Branch", branchWidth) + " " +
+				fitTableCell("State", stateWidth) + " " +
+				fitTableCell("Ahead/Behind", syncWidth) + " " +
+				fitTableCell("Path", pathWidth)
+			b.WriteString(headerStyle.Render(header))
+			b.WriteString("\n")
 		}
 
-		syncInfo := ""
-		if known && st.hasUpstream {
-			syncInfo = fmt.Sprintf(" ↑%d ↓%d", st.ahead, st.behind)
-		}
+		for i, wt := range m.worktrees {
+			st, known := m.statuses[wt.Path]
+			var dot string
+			switch {
+			case !known:
+				dot = staleDot
+			case st.dirty:
+				dot = dirtyDot
+			default:
+				dot = cleanDot
+			}
 
-		line := fmt.Sprintf("%s  %-28s %s%s",
-			dot,
-			branchStyle.Render(wt.DisplayBranch()),
-			pathStyle.Render(wt.Path),
-			pathStyle.Render(syncInfo),
-		)
+			if tinyTable {
+				b.WriteString(renderTinyTableRow(m.width, i == m.cursor, dot, wt.DisplayBranch()))
+				b.WriteString("\n")
+				continue
+			}
 
-		if i == m.cursor {
-			b.WriteString(selectedStyle.Render("> " + line))
-		} else {
-			b.WriteString("  " + line)
+			line := dot + "  " +
+				branchStyle.Render(fitTableCell(wt.DisplayBranch(), branchWidth)) + " " +
+				fitTableCell(stateLabel(st, known), stateWidth) + " " +
+				fitTableCell(syncLabel(st, known), syncWidth) + " " +
+				pathStyle.Render(fitTableCell(func() string {
+					if useNarrowPathStartTruncation(pathWidth) && lipgloss.Width(wt.Path) > pathWidth {
+						return truncatePathStart(wt.Path, pathWidth)
+					}
+					return wt.Path
+				}(), pathWidth))
+
+			if i == m.cursor {
+				b.WriteString(selectedStyle.Render("> " + line))
+			} else {
+				b.WriteString("  " + line)
+			}
+			b.WriteString("\n")
 		}
-		b.WriteString("\n")
 	}
 
 	if m.pending != nil {
@@ -428,12 +757,16 @@ func (m Model) View() string {
 
 	switch m.mode {
 	case modeList:
-		b.WriteString(helpStyle.Render("↑/k up · ↓/j down · enter switch · n new · d delete · r refresh · v vault · q quit"))
+		b.WriteString(helpStyle.Render("↑/k up · ↓/j down · enter switch · n new · b branch · p pull · d delete · r refresh · v vault · q quit"))
 
-	case modeCreate:
+	case modeCreate, modeCreateFromSelected:
 		branch := m.input.Value()
 		b.WriteString("\n")
-		b.WriteString(helpStyle.Render("New worktree") + "\n")
+		if m.mode == modeCreateFromSelected {
+			b.WriteString(helpStyle.Render("Branch from selected") + "\n")
+		} else {
+			b.WriteString(helpStyle.Render("New worktree") + "\n")
+		}
 		b.WriteString("  Branch: " + m.input.View() + "\n")
 		if branch != "" {
 			preview := git.WorktreePath(m.repoDir, branch)
@@ -442,7 +775,11 @@ func (m Model) View() string {
 		if m.err != nil {
 			b.WriteString(errStyle.Render(fmt.Sprintf("  error: %v", m.err)) + "\n")
 		}
-		b.WriteString(helpStyle.Render("enter to create · esc to cancel"))
+		if m.mode == modeCreateFromSelected {
+			b.WriteString(helpStyle.Render("type branch name · enter to create · esc to cancel"))
+		} else {
+			b.WriteString(helpStyle.Render("enter to create · esc to cancel"))
+		}
 
 	case modeDeleteConfirm:
 		if len(m.worktrees) > 0 {

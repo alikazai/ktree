@@ -14,10 +14,16 @@ func (m Model) loadWorktrees() tea.Msg {
 
 func (m Model) loadStatus(wt git.Worktree) tea.Cmd {
 	return func() tea.Msg {
-		dirty, _ := git.IsDirty(wt.Path)
+		dirty, err := git.IsDirty(wt.Path)
 		ahead, behind, hasUpstream := git.AheadBehind(m.repoDir, wt.Branch)
+		var probeErr error
+		if err != nil {
+			probeErr = errProbeFailed(wt.Path, err.Error())
+		}
 		return statusLoadedMsg{
-			path: wt.Path,
+			path:       wt.Path,
+			dirtyKnown: err == nil,
+			probeErr:   probeErr,
 			status: worktreeStatus{
 				dirty:       dirty,
 				ahead:       ahead,
@@ -33,6 +39,24 @@ func (m Model) createWorktree(branch string) tea.Cmd {
 		path := git.WorktreePath(m.repoDir, branch)
 		err := git.AddWorktree(m.repoDir, path, branch)
 		return worktreeCreatedMsg{err: err}
+	}
+}
+
+func (m Model) createWorktreeFromSelected(base git.Worktree, branch string) tea.Cmd {
+	return func() tea.Msg {
+		path := git.WorktreePath(m.repoDir, branch)
+		baseRef := base.Branch
+		if baseRef == "" {
+			baseRef = base.Head
+		}
+		err := git.AddWorktreeFromBase(m.repoDir, path, branch, baseRef)
+		return worktreeCreatedMsg{err: err}
+	}
+}
+
+func (m Model) pullWorktree(wt git.Worktree) tea.Cmd {
+	return func() tea.Msg {
+		return worktreePulledMsg{err: git.PullWorktree(wt.Path)}
 	}
 }
 

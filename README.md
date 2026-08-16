@@ -24,11 +24,12 @@ Run `ktree` from inside any git repo.
 ```
 Worktrees: /home/ali/code/myapp
 
-●  main                         /home/ali/code/myapp
-○  feature/auth                 /home/ali/code/myapp-worktrees/feature-auth  ↑2 ↓0
-●  feat/dashboard               /home/ali/code/myapp-worktrees/feat-dashboard
+  Branch                       State    Ahead/Behind  Path
+● main                         clean    -             /home/ali/code/myapp
+> ● feature/auth               dirty    ↑2 ↓0         /home/ali/code/myapp-worktrees/feature-auth
+○ feat/dashboard               loading  -             /home/ali/code/myapp-worktrees/feat-dashboard
 
-↑/k up · ↓/j down · enter switch · n new · d delete · r refresh · q quit
+↑/k up · ↓/j down · enter switch · n new · b branch · p pull · d delete · r refresh · v vault · q quit
 ```
 
 **Dot legend:** `●` green = clean, `●` amber = uncommitted changes, `○` grey = loading
@@ -41,8 +42,11 @@ Worktrees: /home/ali/code/myapp
 | `↓` / `j` | Move down |
 | `enter` | Switch to selected worktree (see shell setup below) |
 | `n` | Create new worktree |
+| `b` | Create a new branch/worktree from the selected worktree |
+| `p` | Pull the selected worktree |
 | `d` | Delete selected worktree (asks for confirmation) |
 | `r` | Refresh list |
+| `v` | Initialize vault from discovered `.env*` files |
 | `q` / `ctrl+c` | Quit |
 
 ### Shell setup for `enter` (cd to worktree)
@@ -73,11 +77,17 @@ For example, branch `feature/auth` in repo `~/code/myapp` → `~/code/myapp-work
 
 While creation is running, ktree keeps the list visible and shows a bold in-progress status so it is clear the command is still working.
 
+Press `b` to branch from the currently selected worktree into a new worktree. ktree refuses this when the selected worktree is dirty.
+
 ### Deleting a worktree
 
 Press `d` and confirm with `y`. If the worktree has uncommitted changes, ktree shows a second prompt offering a force delete.
 
 While deletion is running, ktree shows the same in-progress feedback. If create/delete fails, ktree restores the relevant prompt and keeps a visible error banner until your next action.
+
+### Pulling a worktree
+
+Press `p` to pull the selected worktree. ktree refuses this when the selected worktree is dirty, detached, or has no upstream configured.
 
 ## Project structure
 
